@@ -4,6 +4,7 @@ import sys
 import logging
 from pathlib import Path
 
+from typing import Dict
 from config import Config
 from twitter_scraper import TwitterScraper
 from media_downloader import MediaDownloader
@@ -112,7 +113,7 @@ def main():
         logger.info("=" * 60)
         logger.info(f"ユーザー名: {args.username}")
         logger.info(f"最大Tweet数: {args.max_tweets if args.max_tweets > 0 else '無制限'}")
-        logger.info(f"メディアダウンロード: {'有効' if args.download_media else '無効'}")
+        logger.info(f"メディアダウンロード: {'有効（並行）' if args.download_media else '無効'}")
         logger.info(f"出力ルート: {Config.OUTPUT_DIR}")
         logger.info(f"今回の保存先: {Config.RUN_DIR}")
         logger.info(f"検索モード: {'ON' if use_search else 'OFF'}")
@@ -122,17 +123,51 @@ def main():
         
         # スクレイパー初期化
         scraper = TwitterScraper()
+        downloader = None
         
         try:
+            # メディアダウンロードの設定
+            # 検索モード（チャンク処理）の場合は同期的にダウンロード（並行ダウンロードは使用しない）
+            use_parallel_download = args.download_media and not use_search
+            
+            if args.download_media:
+                if use_parallel_download:
+                    # プロフィールスクロールモード: 並行ダウンロードを使用
+                    downloader = MediaDownloader(max_workers=3)
+                    downloader.start_parallel_download()
+                    
+                    # コールバック関数: ツイート取得時にメディアダウンロードキューに追加
+                    def on_tweet_fetched(tweet: Dict):
+                        downloader.add_tweet_for_download(tweet)
+                else:
+                    # 検索モード: 同期的にダウンロード（チャンクごとに完了させる）
+                    downloader = MediaDownloader()
+                    on_tweet_fetched = None
+            
             # Tweet取得
             logger.info("Tweet取得を開始します...")
-            tweets = scraper.get_user_tweets(
-                args.username,
-                use_search=use_search,
-                since=since,
-                until=until,
-                days_per_chunk=days_per_chunk,
-            )
+            
+            # 検索モードでメディアダウンロードする場合、downloaderを渡す
+            if use_search and args.download_media and downloader:
+                # downloaderをscraperに設定（チャンクごとにダウンロードするため）
+                scraper._current_downloader = downloader
+                tweets = scraper.get_user_tweets(
+                    args.username,
+                    use_search=use_search,
+                    since=since,
+                    until=until,
+                    days_per_chunk=days_per_chunk,
+                    on_tweet_fetched=None,  # 検索モードではコールバックを使わない
+                )
+            else:
+                tweets = scraper.get_user_tweets(
+                    args.username,
+                    use_search=use_search,
+                    since=since,
+                    until=until,
+                    days_per_chunk=days_per_chunk,
+                    on_tweet_fetched=on_tweet_fetched if use_parallel_download else None,
+                )
             
             if not tweets:
                 logger.warning("Tweetが取得できませんでした")
@@ -140,11 +175,13 @@ def main():
             
             logger.info(f"{len(tweets)}件のTweetを取得しました")
             
-            # メディアダウンロード
+            # メディアダウンロード（検索モードではチャンクごとに既にダウンロード済み）
             if args.download_media:
-                logger.info("メディアダウンロードを開始します...")
-                downloader = MediaDownloader()
-                tweets = downloader.download_media(tweets)
+                if use_parallel_download:
+                    # 並行ダウンロードを停止して完了を待つ
+                    logger.info("並行メディアダウンロードの完了を待機しています...")
+                    downloader.stop_parallel_download(wait_for_completion=True)
+                # 検索モードの場合はチャンクごとに既にダウンロード済みなので、ここでは何もしない
             
             # データ保存
             logger.info("データを保存します...")
@@ -156,22 +193,120 @@ def main():
             
             logger.info("=" * 60)
             logger.info("処理が完了しました！")
-            logger.info(f"出力ディレクトリ: {Config.OUTPUT_DIR}")
+            logger.info(f"出力ディレクトリ: {Config.RUN_DIR}")
             logger.info("=" * 60)
             
         finally:
-            scraper.close()
+            # 途中終了時にも保存（正常終了時は既に保存済み）
+            try:
+                # tweets変数が定義されていない場合、scraperから取得
+                tweets_to_save = None
+                if 'tweets' in locals() and tweets:
+                    tweets_to_save = tweets
+                elif 'scraper' in locals() and scraper and scraper.tweets:
+                    tweets_to_save = scraper.tweets
+                
+                # まだ保存されていない場合のみ保存
+                if tweets_to_save:
+                    run_dir = Config.RUN_DIR
+                    json_path = run_dir / "tweets.json"
+                    partial_path = run_dir / "tweets_partial.json"
+                    if not json_path.exists() and not partial_path.exists():  # 既に保存済みでない場合のみ
+                        logger.info("途中データを保存しています...")
+                        saver = DataSaver()
+                        saver.save_tweets_json(tweets_to_save, filename="tweets_partial.json")
+                        if not args.no_csv:
+                            saver.save_tweets_csv(tweets_to_save, filename="tweets_partial.csv")
+            except Exception as save_error:
+                logger.error(f"途中データの保存中にエラー: {save_error}")
+            
+            if downloader:
+                try:
+                    downloader.stop_parallel_download(wait_for_completion=False)
+                except:
+                    pass
+            if scraper:
+                try:
+                    scraper.close()
+                except:
+                    pass
             
     except KeyboardInterrupt:
         logger.info("\n処理が中断されました")
+        
+        # 中断時にもメディアダウンロードを停止（進行中のダウンロードは少し待機）
+        if 'downloader' in locals() and downloader:
+            logger.info("メディアダウンロードを停止しています（進行中のダウンロードを完了させます）...")
+            downloader.stop_parallel_download(wait_for_completion=True)
+        
+        # 中断時にも途中までのデータを保存
+        tweets_to_save = None
+        if 'tweets' in locals() and tweets:
+            tweets_to_save = tweets
+        elif 'scraper' in locals() and scraper and scraper.tweets:
+            tweets_to_save = scraper.tweets
+        
+        if tweets_to_save:
+            logger.info("途中までのデータを保存しています...")
+            try:
+                saver = DataSaver()
+                partial_path = saver.save_tweets_json(tweets_to_save, filename="tweets_partial.json")
+                if not args.no_csv:
+                    saver.save_tweets_csv(tweets_to_save, filename="tweets_partial.csv")
+                logger.info(f"途中データを保存しました: {partial_path}")
+                logger.info(f"取得済みTweet数: {len(tweets_to_save)}")
+                
+                # ダウンロード済みメディアの数を確認
+                if args.download_media:
+                    downloaded_media = sum(
+                        1 for tweet in tweets_to_save 
+                        for media in tweet.get('media', []) 
+                        if media.get('local_path')
+                    )
+                    total_media = sum(len(tweet.get('media', [])) for tweet in tweets_to_save)
+                    logger.info(f"ダウンロード済みメディア: {downloaded_media}/{total_media}件")
+                
+                logger.info(f"出力ディレクトリ: {Config.RUN_DIR}")
+            except Exception as save_error:
+                logger.error(f"途中データの保存中にエラー: {save_error}")
+        
+        # スクレイパーを閉じる
+        if 'scraper' in locals() and scraper:
+            try:
+                scraper.close()
+            except:
+                pass
+        
         sys.exit(1)
     except Exception as e:
         logger.error(f"エラーが発生しました: {e}", exc_info=True)
-        # 途中までの結果を保存して、次回再開しやすくする
-        if tweets:
-            saver = DataSaver()
-            partial_path = saver.save_tweets_json(tweets, filename="tweets_partial.json")
-            logger.error(f"途中までのデータを保存しました: {partial_path}")
+        
+        # エラー時にも途中までのデータを保存
+        tweets_to_save = None
+        if 'tweets' in locals() and tweets:
+            tweets_to_save = tweets
+        elif 'scraper' in locals() and scraper and scraper.tweets:
+            tweets_to_save = scraper.tweets
+        
+        if tweets_to_save:
+            logger.info("エラー発生時の途中データを保存しています...")
+            try:
+                saver = DataSaver()
+                partial_path = saver.save_tweets_json(tweets_to_save, filename="tweets_error.json")
+                if not args.no_csv:
+                    saver.save_tweets_csv(tweets_to_save, filename="tweets_error.csv")
+                logger.info(f"途中データを保存しました: {partial_path}")
+                logger.info(f"取得済みTweet数: {len(tweets_to_save)}")
+            except Exception as save_error:
+                logger.error(f"途中データの保存中にエラー: {save_error}")
+        
+        # ブラウザを閉じる
+        if 'scraper' in locals() and scraper:
+            try:
+                scraper.close()
+            except:
+                pass
+        
         logger.error("問題が発生しました。再度実行してください。")
         sys.exit(1)
 
