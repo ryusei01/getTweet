@@ -2,6 +2,7 @@
 import time
 import json
 import re
+import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Callable
@@ -11,6 +12,7 @@ import logging
 from tqdm import tqdm
 
 from config import Config
+from media_only import is_target_author
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,8 @@ class TwitterScraper:
         self.page: Optional[Page] = None
         self.playwright = None
         self.tweets: List[Dict] = []
+        # メディアダウンロード対象の作者フィルタ（RT等で別作者になるケース対策）
+        self.media_author_filter: Optional[str] = None
         # 429対策: 初回は15分待機をデフォルトに（Twitterの一般的な制限ウィンドウに合わせる）
         self.rate_limit_wait = 900  # 15分（秒）
         
@@ -302,6 +306,7 @@ class TwitterScraper:
         until: Optional[str] = None,
         days_per_chunk: int = 7,
         on_tweet_fetched: Optional[Callable[[Dict], None]] = None,
+        parallel_chunks: Optional[bool] = None,
     ) -> List[Dict]:
         """指定ユーザーのTweetを取得（他人のアカウントも可）
         
@@ -312,6 +317,7 @@ class TwitterScraper:
             until: 取得終了日 (YYYY-MM-DD)。未指定なら今日
             days_per_chunk: 検索モード時のチャンク日数
             on_tweet_fetched: ツイート取得時に呼ばれるコールバック関数
+            parallel_chunks: 検索モード時にチャンクを並行処理するか（NoneならConfigを使用）
             
         Returns:
             Tweetデータのリスト
@@ -320,7 +326,7 @@ class TwitterScraper:
             self._setup_browser()
         
         if use_search:
-            return self._get_tweets_by_search(username, since, until, days_per_chunk, on_tweet_fetched)
+            return self._get_tweets_by_search(username, since, until, days_per_chunk, on_tweet_fetched, parallel_chunks=parallel_chunks)
         else:
             return self._get_tweets_by_scroll(username, on_tweet_fetched)
 
@@ -611,12 +617,16 @@ class TwitterScraper:
                             # チャンクごとのメディアダウンロード
                             if downloader and chunk_tweets:
                                 logger.info(f"チャンク {since_d} - {until_d} のメディアをダウンロード中...")
-                                chunk_tweets = downloader.download_media(chunk_tweets)
-                                # ダウンロード済みのメディアパスをself.tweetsにも反映
-                                for i, tweet in enumerate(self.tweets):
-                                    if tweet.get('tweet_id') in [t.get('tweet_id') for t in chunk_tweets]:
-                                        chunk_tweet = next(t for t in chunk_tweets if t.get('tweet_id') == tweet.get('tweet_id'))
-                                        tweet['media'] = chunk_tweet.get('media', [])
+                                tweets_for_media = chunk_tweets
+                                if self.media_author_filter:
+                                    tweets_for_media = [t for t in chunk_tweets if is_target_author(t, self.media_author_filter)]
+                                if tweets_for_media:
+                                    downloaded_chunk = downloader.download_media(tweets_for_media)
+                                    downloaded_map = {t.get("tweet_id"): t for t in downloaded_chunk}
+                                    for tweet in self.tweets:
+                                        tid = tweet.get("tweet_id")
+                                        if tid in downloaded_map:
+                                            tweet["media"] = downloaded_map[tid].get("media", [])
                             return self.tweets
 
                         if self._is_rate_limited():
@@ -675,12 +685,16 @@ class TwitterScraper:
                     # チャンクごとのメディアダウンロード
                     if downloader and chunk_tweets:
                         logger.info(f"チャンク {since_d} - {until_d} のメディアをダウンロード中... ({len(chunk_tweets)}件)")
-                        chunk_tweets = downloader.download_media(chunk_tweets)
-                        # ダウンロード済みのメディアパスをself.tweetsにも反映
-                        for i, tweet in enumerate(self.tweets):
-                            if tweet.get('tweet_id') in [t.get('tweet_id') for t in chunk_tweets]:
-                                chunk_tweet = next(t for t in chunk_tweets if t.get('tweet_id') == tweet.get('tweet_id'))
-                                tweet['media'] = chunk_tweet.get('media', [])
+                        tweets_for_media = chunk_tweets
+                        if self.media_author_filter:
+                            tweets_for_media = [t for t in chunk_tweets if is_target_author(t, self.media_author_filter)]
+                        if tweets_for_media:
+                            downloaded_chunk = downloader.download_media(tweets_for_media)
+                            downloaded_map = {t.get("tweet_id"): t for t in downloaded_chunk}
+                            for tweet in self.tweets:
+                                tid = tweet.get("tweet_id")
+                                if tid in downloaded_map:
+                                    tweet["media"] = downloaded_map[tid].get("media", [])
                         
                 except Exception as e:
                     logger.error(f"検索チャンク取得中にエラー: {e}", exc_info=True)
@@ -1152,6 +1166,7 @@ class TwitterScraper:
     def _extract_media(self, element, tweet_id: str) -> List[Dict]:
         """メディア（画像、動画）を抽出"""
         media_list = []
+        seen_urls = set()
         
         try:
             # 画像を取得
@@ -1161,11 +1176,37 @@ class TwitterScraper:
                     try:
                         src = img.get_attribute('src')
                         if src and 'profile_images' not in src:  # プロフィール画像を除外
-                            media_list.append({
-                                'type': 'photo',
-                                'url': src,
-                                'media_index': idx
-                            })
+                            # 動画ツイートの場合、サムネイル画像（ext_tw_video_thumb等）が混ざることがある
+                            # これをphoto扱いすると「動画なのにphoto」問題が発生するため、別タイプで保持する
+                            media_type = 'photo'
+                            if any(k in src for k in ["ext_tw_video_thumb", "amplify_video_thumb"]):
+                                media_type = 'video_thumbnail'
+
+                                # 可能なら実動画URLを拾ってvideoも追加する
+                                try:
+                                    video_src = self._resolve_video_from_api(tweet_id)
+                                    if not video_src:
+                                        html = element.inner_html() or ""
+                                        video_src = self._pick_video_url_from_html(html)
+
+                                    if video_src and not video_src.startswith("blob:") and video_src not in seen_urls:
+                                        media_list.append({
+                                            'type': 'video',
+                                            'url': video_src,
+                                            'media_index': idx,
+                                            'thumbnail_url': src,
+                                        })
+                                        seen_urls.add(video_src)
+                                except Exception:
+                                    pass
+
+                            if src not in seen_urls:
+                                media_list.append({
+                                    'type': media_type,
+                                    'url': src,
+                                    'media_index': idx
+                                })
+                                seen_urls.add(src)
                     except Exception:
                         continue  # 個別の画像要素が無効でも続行
             except Exception:
@@ -1176,13 +1217,42 @@ class TwitterScraper:
                 video_elements = element.query_selector_all('video')
                 for idx, video in enumerate(video_elements):
                     try:
+                        # 1) video[src] を優先（稀に直MP4が入る）
                         src = video.get_attribute('src')
-                        if src:
+
+                        # 2) video > source[src] を探索（こちらの方が直URLになりやすい）
+                        if not src or (isinstance(src, str) and src.startswith("blob:")):
+                            try:
+                                sources = video.query_selector_all("source")
+                                for s in sources:
+                                    s_src = s.get_attribute("src")
+                                    if s_src and not s_src.startswith("blob:"):
+                                        # Twitterの動画は video.twimg.com のMP4が多い
+                                        src = s_src
+                                        break
+                            except Exception:
+                                pass
+
+                        # 3) element内HTMLから video.twimg.com のURLを正規表現で拾う（blob対策）
+                        if not src or (isinstance(src, str) and src.startswith("blob:")):
+                            try:
+                                html = element.inner_html() or ""
+                                src = self._pick_video_url_from_html(html)
+                            except Exception:
+                                pass
+
+                        # 4) それでもダメなら Syndication API を試す（最も確実）
+                        if not src or (isinstance(src, str) and src.startswith("blob:")):
+                            src = self._resolve_video_from_api(tweet_id)
+
+                        # URLが取得できた場合のみ追加
+                        if src and not src.startswith("blob:") and src not in seen_urls:
                             media_list.append({
                                 'type': 'video',
                                 'url': src,
                                 'media_index': idx
                             })
+                            seen_urls.add(src)
                     except Exception:
                         continue  # 個別の動画要素が無効でも続行
             except Exception:
@@ -1195,6 +1265,60 @@ class TwitterScraper:
                 logger.debug(f"メディア抽出エラー: {e}")
         
         return media_list
+
+    @staticmethod
+    def _pick_video_url_from_html(html: str) -> Optional[str]:
+        """HTML文字列から video.twimg.com の動画URLを拾う（MP4優先、次にWebM、最後にm3u8）"""
+        if not html:
+            return None
+        # MP4優先。なければm3u8も拾う（DL側で扱い）
+        mp4s = re.findall(r"https://video\.twimg\.com/[^\"'\\s>]+?\.mp4[^\"'\\s>]*", html)
+        if mp4s:
+            return mp4s[0]
+        webms = re.findall(r"https://video\.twimg\.com/[^\"'\\s>]+?\.webm[^\"'\\s>]*", html)
+        if webms:
+            return webms[0]
+        m3u8s = re.findall(r"https://video\.twimg\.com/[^\"'\\s>]+?\.m3u8[^\"'\\s>]*", html)
+        if m3u8s:
+            return m3u8s[0]
+        return None
+
+    def _resolve_video_from_api(self, tweet_id: str) -> Optional[str]:
+        """Syndication APIを使って動画URLを取得（最も高画質なMP4/WebMを選択）"""
+        url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en"
+        try:
+            # ログイン不要のエンドポイント
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            
+            video_info = None
+            media_items = data.get("mediaDetails", []) or data.get("entities", {}).get("media", [])
+            for m in media_items:
+                v_info = m.get("video_info")
+                if v_info:
+                    video_info = v_info
+                    break
+            
+            if not video_info:
+                return None
+                
+            variants = video_info.get("variants", [])
+            # 最もビットレートが高いMP4を優先。無ければWebM。最後にm3u8。
+            mp4s = [v for v in variants if v.get("content_type") == "video/mp4" and v.get("url")]
+            webms = [v for v in variants if v.get("content_type") == "video/webm" and v.get("url")]
+            if mp4s:
+                mp4s.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                return mp4s[0].get("url")
+            if webms:
+                webms.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                return webms[0].get("url")
+
+            m3u8s = [v for v in variants if v.get("url") and ".m3u8" in v.get("url")]
+            return m3u8s[0].get("url") if m3u8s else None
+        except Exception:
+            return None
 
     def _is_rate_limited(self) -> bool:
         """429/問題発生ページを検知"""

@@ -8,11 +8,66 @@ from tqdm import tqdm
 import time
 from queue import Queue
 from threading import Thread
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import subprocess
+import tempfile
 
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# region agent log
+_DEBUG_LOG_PATH = r"h:\document\program\project\getTweet\.cursor\debug.log"
+from pathlib import Path as _AgentPath
+_LOCAL_DEBUG_NDJSON = str((_AgentPath(__file__).resolve().parent / "debug.ndjson"))
+_LOCAL_CURSOR_DEBUG = str((_AgentPath(__file__).resolve().parent / ".cursor" / "debug.log"))
+
+
+def _agent_log(hypothesisId: str, location: str, message: str, data: dict = None, runId: str = "pre") -> None:
+    try:
+        import json as _json
+        import time as _time
+
+        payload = {
+            "sessionId": "debug-session",
+            "runId": runId,
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(_time.time() * 1000),
+        }
+        line = _json.dumps(payload, ensure_ascii=False) + "\n"
+        try:
+            _AgentPath(_DEBUG_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+        try:
+            with open(_LOCAL_DEBUG_NDJSON, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+        try:
+            _AgentPath(_LOCAL_CURSOR_DEBUG).parent.mkdir(parents=True, exist_ok=True)
+            with open(_LOCAL_CURSOR_DEBUG, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _safe_url_tag(url: str) -> str:
+    try:
+        return (url or "")[:160]
+    except Exception:
+        return ""
+
+# endregion
 
 
 class MediaDownloader:
@@ -25,13 +80,18 @@ class MediaDownloader:
         """
         self.config = Config
         self.max_workers = max_workers
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        # requests.Sessionはスレッドセーフではないため、スレッドローカルで管理
+        self._thread_local = threading.local()
+
+        self._base_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+        }
         # Cookieが設定されている場合はリクエストにも付与（非公開アカウントのメディア取得に必要）
         if self.config.TWITTER_COOKIES:
-            self.session.headers.update({'Cookie': self.config.TWITTER_COOKIES})
+            self._base_headers['Cookie'] = self.config.TWITTER_COOKIES
         
         # 並行ダウンロード用のキューとスレッド
         self.download_queue: Queue = Queue()
@@ -40,6 +100,15 @@ class MediaDownloader:
         self.downloaded_count = 0
         self.total_media = 0
         self.pbar: Optional[tqdm] = None
+
+    def _get_session(self) -> requests.Session:
+        """スレッドごとのSessionを返す"""
+        sess = getattr(self._thread_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            sess.headers.update(self._base_headers)
+            self._thread_local.session = sess
+        return sess
     
     def download_media(self, tweets: List[Dict]) -> List[Dict]:
         """Tweetに含まれるメディアをダウンロード（同期的）"""
@@ -55,10 +124,14 @@ class MediaDownloader:
         with tqdm(total=total_media, desc="メディアダウンロード", unit="件") as pbar:
             for tweet in tweets:
                 tweet_id = tweet.get('tweet_id')
+                tweet_url = tweet.get('url')
                 media_list = tweet.get('media', [])
                 
                 for media in media_list:
                     try:
+                        # Refererとして使えるように保持（ダウンロードの403回避に効くことがある）
+                        if tweet_url and isinstance(media, dict) and 'tweet_url' not in media:
+                            media['tweet_url'] = tweet_url
                         local_path = self._download_single_media(media, tweet_id)
                         if local_path:
                             media['local_path'] = str(local_path)
@@ -185,9 +258,13 @@ class MediaDownloader:
             return
         
         tweet_id = tweet.get('tweet_id')
+        tweet_url = tweet.get('url')  # Referer用
         media_list = tweet.get('media', [])
         
         for media in media_list:
+            # Refererとして使えるように保持（ダウンロードの403回避に効くことがある）
+            if tweet_url and isinstance(media, dict) and 'tweet_url' not in media:
+                media['tweet_url'] = tweet_url
             self.download_queue.put((tweet_id, media))
             self.total_media += 1
         
@@ -232,18 +309,39 @@ class MediaDownloader:
         
         if not url:
             return None
+
+        # blob: はブラウザ内部URLなのでrequestsでは取得できない
+        if isinstance(url, str) and url.startswith("blob:"):
+            logger.warning(f"blob URLのためスキップします: {tweet_id} idx={media_index}")
+            return None
+
+        # Referer（あると403回避に効くことがある）
+        referer = None
+        if isinstance(media, dict):
+            referer = media.get("tweet_url") or None
+        if not referer:
+            referer = "https://twitter.com/"
         
         # URLを高解像度版に変換（画像の場合）
         if media_type == 'photo' and '?format=' not in url:
             # 高解像度版を取得
             url = url.replace(':small', ':large').replace(':thumb', ':large')
+
+        # HLS(m3u8)はrequestsで素直に落としても動画にならないので、ffmpegがあれば変換する
+        if isinstance(url, str) and ".m3u8" in url:
+            _agent_log("H1", "media_downloader.py:_download_single_media", "m3u8 detected", {"tweet_id": tweet_id, "url": _safe_url_tag(url)})
+            return self._download_hls_with_ffmpeg(url, tweet_id, media_index, referer)
         
         max_retry = 3
         backoff = 60  # 秒
         
         for attempt in range(1, max_retry + 1):
             try:
-                response = self.session.get(url, timeout=30, stream=True)
+                sess = self._get_session()
+                headers = {'Referer': referer}
+                _agent_log("H2", "media_downloader.py:_download_single_media", "request", {"tweet_id": tweet_id, "type": media_type, "attempt": attempt, "url": _safe_url_tag(url), "referer": referer[:60]})
+                response = sess.get(url, timeout=30, stream=True, headers=headers)
+                _agent_log("H2", "media_downloader.py:_download_single_media", "response", {"tweet_id": tweet_id, "status": response.status_code, "ctype": response.headers.get("content-type", "")[:80]})
                 
                 if response.status_code == 429:
                     # 429は一般的に15分ウィンドウのことが多いので、最低900秒待機に引き上げ
@@ -252,14 +350,19 @@ class MediaDownloader:
                     time.sleep(wait_for)
                     backoff = min(wait_for * 2, 3600)  # 最大1時間
                     continue
+
+                if response.status_code in (401, 403):
+                    # RefererやCookie不足、保護ツイート等
+                    logger.warning(f"{response.status_code} (media): {url} - Referer/Cookieが必要な可能性があります")
                 
                 response.raise_for_status()
                 
                 # ファイル拡張子を決定
                 ext = self._get_extension(url, media_type, response.headers.get('content-type'))
+                _agent_log("H4", "media_downloader.py:_download_single_media", "extension", {"tweet_id": tweet_id, "ext": ext, "type": media_type})
                 
                 # 保存先パスを決定
-                if media_type == 'photo':
+                if media_type in ['photo', 'video_thumbnail']:
                     save_dir = self.config.IMAGES_DIR
                 elif media_type in ['video', 'animated_gif']:
                     save_dir = self.config.VIDEOS_DIR
@@ -268,11 +371,26 @@ class MediaDownloader:
                 
                 filename = f"{tweet_id}_{media_index}{ext}"
                 save_path = save_dir / filename
+
+                # 既に存在する場合はスキップ
+                if save_path.exists() and save_path.stat().st_size > 0:
+                    return save_path
                 
-                # ファイルを保存
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                # 原子的に保存（途中で落ちても壊れファイルを残しにくい）
+                tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"{tweet_id}_{media_index}_", suffix=ext, dir=str(save_dir))
+                os.close(tmp_fd)
+                try:
+                    with open(tmp_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    Path(tmp_path).replace(save_path)
+                finally:
+                    try:
+                        if Path(tmp_path).exists():
+                            Path(tmp_path).unlink()
+                    except Exception:
+                        pass
                 
                 # ファイルサイズを記録
                 file_size = save_path.stat().st_size
@@ -288,13 +406,136 @@ class MediaDownloader:
                 logger.info(f"再試行します ({attempt}/{max_retry})")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 300)
+
+    def _download_hls_with_ffmpeg(self, m3u8_url: str, tweet_id: str, media_index: int, referer: str) -> Optional[Path]:
+        """m3u8(HLS)をffmpegでmp4として保存（ffmpegが無ければスキップ）"""
+        # region agent log
+        _agent_log("H1", "media_downloader.py:_download_hls_with_ffmpeg", "enter", {"tweet_id": tweet_id, "m3u8_url": _safe_url_tag(m3u8_url), "referer": _safe_url_tag(referer)})
+        # endregion
+        
+        ffmpeg = shutil.which("ffmpeg")
+        # region agent log
+        _agent_log("H1", "media_downloader.py:_download_hls_with_ffmpeg", "ffmpeg_check", {"ffmpeg_path": ffmpeg or "NOT_FOUND", "tweet_id": tweet_id})
+        # endregion
+        
+        if not ffmpeg:
+            logger.warning(f"m3u8のためffmpegが必要です。スキップします: {m3u8_url}")
+            # region agent log
+            _agent_log("H1", "media_downloader.py:_download_hls_with_ffmpeg", "ffmpeg_not_found", {"tweet_id": tweet_id, "m3u8_url": _safe_url_tag(m3u8_url)})
+            # endregion
+            return None
+
+        save_dir = self.config.VIDEOS_DIR
+        # region agent log
+        _agent_log("H2", "media_downloader.py:_download_hls_with_ffmpeg", "before_mkdir", {"save_dir": str(save_dir), "tweet_id": tweet_id})
+        # endregion
+        
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            # region agent log
+            _agent_log("H2", "media_downloader.py:_download_hls_with_ffmpeg", "mkdir_failed", {"save_dir": str(save_dir), "error": str(e), "tweet_id": tweet_id})
+            # endregion
+            logger.error(f"保存ディレクトリの作成に失敗: {e}")
+            return None
+        
+        save_path = save_dir / f"{tweet_id}_{media_index}.mp4"
+        # region agent log
+        _agent_log("H3", "media_downloader.py:_download_hls_with_ffmpeg", "check_existing", {"save_path": str(save_path), "exists": save_path.exists() if save_path.exists() else False, "tweet_id": tweet_id})
+        # endregion
+        
+        if save_path.exists() and save_path.stat().st_size > 0:
+            # region agent log
+            _agent_log("H3", "media_downloader.py:_download_hls_with_ffmpeg", "already_exists", {"save_path": str(save_path), "size": save_path.stat().st_size, "tweet_id": tweet_id})
+            # endregion
+            return save_path
+
+        # Refererが必要なケースに備えて、ffmpegにヘッダを渡す
+        # -headers は "Key: Value\r\n" 形式を連結
+        headers = f"Referer: {referer}\r\n"
+        if self.config.TWITTER_COOKIES:
+            headers += f"Cookie: {self.config.TWITTER_COOKIES}\r\n"
+        
+        # region agent log
+        _agent_log("H4", "media_downloader.py:_download_hls_with_ffmpeg", "before_cmd", {"has_cookie": bool(self.config.TWITTER_COOKIES), "headers_len": len(headers), "tweet_id": tweet_id})
+        # endregion
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel", "error",
+            "-headers", headers,
+            "-i", m3u8_url,
+            "-c", "copy",
+            str(save_path),
+        ]
+        # region agent log
+        _agent_log("H4", "media_downloader.py:_download_hls_with_ffmpeg", "cmd_constructed", {"cmd_len": len(cmd), "tweet_id": tweet_id})
+        # endregion
+        
+        try:
+            # region agent log
+            _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "subprocess_start", {"tweet_id": tweet_id, "m3u8_url": _safe_url_tag(m3u8_url)})
+            # endregion
+            
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+            
+            # region agent log
+            _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "subprocess_success", {"tweet_id": tweet_id, "returncode": result.returncode, "save_path": str(save_path), "file_exists": save_path.exists() if save_path.exists() else False})
+            # endregion
+            
+            if save_path.exists() and save_path.stat().st_size > 0:
+                # region agent log
+                _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "file_saved", {"tweet_id": tweet_id, "save_path": str(save_path), "size": save_path.stat().st_size})
+                # endregion
+                return save_path
+            else:
+                # region agent log
+                _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "file_not_created", {"tweet_id": tweet_id, "save_path": str(save_path)})
+                # endregion
+                logger.error(f"ffmpeg実行後、ファイルが作成されませんでした: {save_path}")
+                return None
+                
+        except subprocess.TimeoutExpired as e:
+            # region agent log
+            _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "subprocess_timeout", {"tweet_id": tweet_id, "error": str(e)})
+            # endregion
+            logger.error(f"ffmpegでのm3u8保存がタイムアウトしました: {e}")
+            try:
+                if save_path.exists() and save_path.stat().st_size == 0:
+                    save_path.unlink()
+            except Exception:
+                pass
+            return None
+        except subprocess.CalledProcessError as e:
+            # region agent log
+            _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "subprocess_error", {"tweet_id": tweet_id, "returncode": e.returncode, "stderr": (e.stderr or "")[:500], "stdout": (e.stdout or "")[:500]})
+            # endregion
+            logger.error(f"ffmpegでのm3u8保存に失敗 (returncode={e.returncode}): {e.stderr or e.stdout or str(e)}")
+            try:
+                if save_path.exists() and save_path.stat().st_size == 0:
+                    save_path.unlink()
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            # region agent log
+            _agent_log("H5", "media_downloader.py:_download_hls_with_ffmpeg", "exception", {"tweet_id": tweet_id, "error_type": type(e).__name__, "error": str(e)[:500]})
+            # endregion
+            logger.error(f"ffmpegでのm3u8保存に失敗: {e}")
+            try:
+                if save_path.exists() and save_path.stat().st_size == 0:
+                    save_path.unlink()
+            except Exception:
+                pass
+            return None
     
     def _get_extension(self, url: str, media_type: str, content_type: str = None) -> str:
         """ファイル拡張子を取得"""
         # URLから拡張子を取得
         if '.' in url:
             ext = '.' + url.split('.')[-1].split('?')[0].split(':')[0]
-            if ext.lower() in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.mov']:
+            if ext.lower() in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.mov', '.webm']:
                 return ext
         
         # Content-Typeから拡張子を決定
@@ -309,6 +550,8 @@ class MediaDownloader:
                 return '.webp'
             elif 'video/mp4' in content_type:
                 return '.mp4'
+            elif 'video/webm' in content_type:
+                return '.webm'
         
         # デフォルト
         if media_type == 'photo':
