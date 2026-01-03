@@ -330,7 +330,7 @@ class MediaDownloader:
         # HLS(m3u8)はrequestsで素直に落としても動画にならないので、ffmpegがあれば変換する
         if isinstance(url, str) and ".m3u8" in url:
             _agent_log("H1", "media_downloader.py:_download_single_media", "m3u8 detected", {"tweet_id": tweet_id, "url": _safe_url_tag(url)})
-            return self._download_hls_with_ffmpeg(url, tweet_id, media_index, referer)
+            return self._download_hls_by_segments(url, tweet_id, media_index, referer)
         
         max_retry = 3
         backoff = 60  # 秒
@@ -407,13 +407,346 @@ class MediaDownloader:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 300)
 
+
+    def _parse_m3u8_playlist(self, m3u8_url: str, referer: str) -> List[str]:
+        """m3u8ファイルをダウンロードしてパースし、セグメントURLのリストを返す"""
+        # region agent log
+        _agent_log("HLS1", "media_downloader.py:_parse_m3u8_playlist", "enter", {"m3u8_url": _safe_url_tag(m3u8_url)})
+        # endregion
+        
+        sess = self._get_session()
+        headers = {'Referer': referer}
+        
+        try:
+            response = sess.get(m3u8_url, timeout=20, headers=headers)
+            response.raise_for_status()
+            text = response.text or ""
+            
+            # region agent log
+            _agent_log("HLS1", "media_downloader.py:_parse_m3u8_playlist", "downloaded", {"m3u8_url": _safe_url_tag(m3u8_url), "content_length": len(text)})
+            # endregion
+            
+            # master m3u8かどうかをチェック（#EXT-X-STREAM-INFがある場合）
+            if "#EXT-X-STREAM-INF" in text:
+                # region agent log
+                _agent_log("HLS1", "media_downloader.py:_parse_m3u8_playlist", "master_playlist", {"m3u8_url": _safe_url_tag(m3u8_url)})
+                # endregion
+                
+                # 最高帯域のvariantを選択
+                best_bw = -1
+                best_uri = None
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                for i, ln in enumerate(lines):
+                    if ln.startswith("#EXT-X-STREAM-INF"):
+                        m = None
+                        try:
+                            m = next((p for p in ln.split(",") if "BANDWIDTH=" in p), None)
+                        except Exception:
+                            m = None
+                        bw = -1
+                        if m and "BANDWIDTH=" in m:
+                            try:
+                                bw = int(m.split("BANDWIDTH=")[-1])
+                            except Exception:
+                                bw = -1
+                        # 次行がURI
+                        if i + 1 < len(lines):
+                            uri = lines[i + 1]
+                            if not uri.startswith("#"):
+                                if bw > best_bw:
+                                    best_bw = bw
+                                    best_uri = uri
+                
+                if best_uri:
+                    # 相対URL対応（/で始まる場合はオリジンからの絶対パス）
+                    if best_uri.startswith("http"):
+                        variant_url = best_uri
+                    elif best_uri.startswith("/"):
+                        from urllib.parse import urlparse
+                        parsed = urlparse(m3u8_url)
+                        origin = f"{parsed.scheme}://{parsed.netloc}"
+                        variant_url = f"{origin}{best_uri}"
+                    else:
+                        base = m3u8_url.rsplit("/", 1)[0]
+                        variant_url = f"{base}/{best_uri}"
+                    
+                    # region agent log
+                    _agent_log("HLS1", "media_downloader.py:_parse_m3u8_playlist", "selected_variant", {"variant_url": _safe_url_tag(variant_url), "bandwidth": best_bw})
+                    # endregion
+                    
+                    # 再帰的にvariantのm3u8を取得
+                    return self._parse_m3u8_playlist(variant_url, referer)
+            
+            # セグメントURLを抽出（#EXTINFの後の行）
+            segments: List[str] = []
+            lines = text.splitlines()
+            base_url = m3u8_url.rsplit("/", 1)[0]
+            
+            # オリジン抽出（/で始まる絶対パス用）
+            from urllib.parse import urlparse
+            parsed = urlparse(m3u8_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if line.startswith("#EXTINF"):
+                    # 次の行がセグメントURL
+                    if i + 1 < len(lines):
+                        segment_url = lines[i + 1].strip()
+                        if segment_url and not segment_url.startswith("#"):
+                            # 相対URL対応（/で始まる場合はオリジンからの絶対パス）
+                            if segment_url.startswith("http"):
+                                segments.append(segment_url)
+                            elif segment_url.startswith("/"):
+                                segments.append(f"{origin}{segment_url}")
+                            else:
+                                segments.append(f"{base_url}/{segment_url}")
+            
+            # region agent log
+            _agent_log("HLS1", "media_downloader.py:_parse_m3u8_playlist", "parsed", {"segment_count": len(segments), "sample": [_safe_url_tag(s) for s in segments[:3]]})
+            # endregion
+            
+            return segments
+            
+        except Exception as e:
+            # region agent log
+            _agent_log("HLS1", "media_downloader.py:_parse_m3u8_playlist", "error", {"error": str(e)[:200]})
+            # endregion
+            logger.error(f"m3u8パースエラー: {e}")
+            return []
+    
+    def _download_segments(self, segment_urls: List[str], referer: str, temp_dir: Path) -> List[Path]:
+        """セグメントURLのリストから各セグメントをダウンロード"""
+        # region agent log
+        _agent_log("HLS2", "media_downloader.py:_download_segments", "enter", {"segment_count": len(segment_urls)})
+        # endregion
+        
+        sess = self._get_session()
+        headers = {'Referer': referer}
+        downloaded_segments: List[Path] = []
+        
+        for idx, segment_url in enumerate(segment_urls):
+            try:
+                # region agent log
+                _agent_log("HLS2", "media_downloader.py:_download_segments", "downloading", {"index": idx, "total": len(segment_urls), "url": _safe_url_tag(segment_url)})
+                # endregion
+                
+                response = sess.get(segment_url, timeout=30, headers=headers, stream=True)
+                response.raise_for_status()
+                
+                segment_path = temp_dir / f"segment_{idx:05d}.ts"
+                with open(segment_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                downloaded_segments.append(segment_path)
+                
+                # region agent log
+                _agent_log("HLS2", "media_downloader.py:_download_segments", "downloaded", {"index": idx, "size": segment_path.stat().st_size})
+                # endregion
+                
+            except Exception as e:
+                # region agent log
+                _agent_log("HLS2", "media_downloader.py:_download_segments", "error", {"index": idx, "error": str(e)[:200]})
+                # endregion
+                logger.error(f"セグメントダウンロードエラー ({segment_url}): {e}")
+                # エラーがあっても続行（一部セグメントが失敗しても結合は試みる）
+        
+        # region agent log
+        _agent_log("HLS2", "media_downloader.py:_download_segments", "complete", {"downloaded_count": len(downloaded_segments), "total": len(segment_urls)})
+        # endregion
+        
+        return downloaded_segments
+    
+    def _concatenate_segments(self, segment_paths: List[Path], output_path: Path) -> bool:
+        """セグメントファイルを結合"""
+        # region agent log
+        _agent_log("HLS3", "media_downloader.py:_concatenate_segments", "enter", {"segment_count": len(segment_paths), "output": str(output_path)})
+        # endregion
+        
+        if not segment_paths:
+            # region agent log
+            _agent_log("HLS3", "media_downloader.py:_concatenate_segments", "no_segments", {})
+            # endregion
+            return False
+        
+        try:
+            # .tsファイルを単純にバイナリ連結
+            with open(output_path, 'wb') as outfile:
+                for seg_path in segment_paths:
+                    if seg_path.exists():
+                        with open(seg_path, 'rb') as infile:
+                            outfile.write(infile.read())
+            
+            # region agent log
+            _agent_log("HLS3", "media_downloader.py:_concatenate_segments", "concatenated", {"output_size": output_path.stat().st_size if output_path.exists() else 0})
+            # endregion
+            
+            return output_path.exists() and output_path.stat().st_size > 0
+            
+        except Exception as e:
+            # region agent log
+            _agent_log("HLS3", "media_downloader.py:_concatenate_segments", "error", {"error": str(e)[:200]})
+            # endregion
+            logger.error(f"セグメント結合エラー: {e}")
+            return False
+    
+    def _download_hls_by_segments(self, m3u8_url: str, tweet_id: str, media_index: int, referer: str) -> Optional[Path]:
+        """m3u8(HLS)をセグメントごとにダウンロードして結合"""
+        # region agent log
+        _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "enter", {"tweet_id": tweet_id, "m3u8_url": _safe_url_tag(m3u8_url), "referer": _safe_url_tag(referer)})
+        # endregion
+        
+        save_dir = self.config.VIDEOS_DIR
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            # region agent log
+            _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "mkdir_failed", {"error": str(e)})
+            # endregion
+            logger.error(f"保存ディレクトリの作成に失敗: {e}")
+            return None
+        
+        save_path = save_dir / f"{tweet_id}_{media_index}.mp4"
+        if save_path.exists() and save_path.stat().st_size > 0:
+            # region agent log
+            _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "already_exists", {"size": save_path.stat().st_size})
+            # endregion
+            return save_path
+        
+        # ステップ1: m3u8ファイルをパースしてセグメントURLを取得
+        segment_urls = self._parse_m3u8_playlist(m3u8_url, referer)
+        if not segment_urls:
+            # region agent log
+            _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "no_segments", {})
+            # endregion
+            logger.error(f"m3u8からセグメントURLを取得できませんでした: {m3u8_url}")
+            return None
+        
+        # ステップ2: セグメントをダウンロード（一時ディレクトリに保存）
+        temp_dir = tempfile.mkdtemp(prefix=f"hls_{tweet_id}_{media_index}_")
+        temp_path = Path(temp_dir)
+        
+        try:
+            downloaded_segments = self._download_segments(segment_urls, referer, temp_path)
+            
+            if not downloaded_segments:
+                # region agent log
+                _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "no_downloaded_segments", {})
+                # endregion
+                logger.error(f"セグメントのダウンロードに失敗しました")
+                return None
+            
+            # ステップ3: セグメントを結合（一時ファイルとして.tsで保存）
+            temp_ts = temp_path / "combined.ts"
+            success = self._concatenate_segments(downloaded_segments, temp_ts)
+            
+            if not success or not temp_ts.exists():
+                # region agent log
+                _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "concatenate_failed", {})
+                # endregion
+                logger.error(f"セグメントの結合に失敗しました")
+                return None
+            
+            # ステップ4: .tsファイルをMP4に変換（ffmpegがあれば）
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                # region agent log
+                _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "converting_to_mp4", {})
+                # endregion
+                try:
+                    cmd = [
+                        ffmpeg,
+                        "-y",
+                        "-loglevel", "error",
+                        "-i", str(temp_ts),
+                        "-c", "copy",
+                        str(save_path),
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+                    if save_path.exists() and save_path.stat().st_size > 0:
+                        # region agent log
+                        _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "success", {"save_path": str(save_path), "size": save_path.stat().st_size})
+                        # endregion
+                        return save_path
+                except Exception as e:
+                    # region agent log
+                    _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "ffmpeg_conversion_failed", {"error": str(e)[:200]})
+                    # endregion
+                    logger.warning(f"ffmpegでのMP4変換に失敗: {e}")
+            
+            # ffmpegがない場合、または変換に失敗した場合は.tsファイルのまま保存
+            ts_save_path = save_dir / f"{tweet_id}_{media_index}.ts"
+            try:
+                import shutil as _shutil
+                _shutil.move(str(temp_ts), str(ts_save_path))
+            except Exception as e:
+                # region agent log
+                _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "move_failed", {"error": str(e)[:200]})
+                # endregion
+                logger.error(f".tsファイルの移動に失敗: {e}")
+                return None
+            
+            # region agent log
+            _agent_log("HLS0", "media_downloader.py:_download_hls_by_segments", "saved_as_ts", {"save_path": str(ts_save_path), "size": ts_save_path.stat().st_size})
+            # endregion
+            logger.info(f".tsファイルとして保存しました（多くのプレーヤーで再生可能）: {ts_save_path}")
+            return ts_save_path
+                
+        finally:
+            # 一時ファイルをクリーンアップ
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
     def _download_hls_with_ffmpeg(self, m3u8_url: str, tweet_id: str, media_index: int, referer: str) -> Optional[Path]:
         """m3u8(HLS)をffmpegでmp4として保存（ffmpegが無ければスキップ）"""
         # region agent log
         _agent_log("H1", "media_downloader.py:_download_hls_with_ffmpeg", "enter", {"tweet_id": tweet_id, "m3u8_url": _safe_url_tag(m3u8_url), "referer": _safe_url_tag(referer)})
         # endregion
         
+        # ffmpegを探す（まずPATHから、見つからなければシステム環境変数から直接取得）
         ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            # システム環境変数から直接取得を試みる（Windows環境変数が現在のプロセスに反映されていない場合）
+            import os
+            path_entries = []
+            
+            # 現在のプロセスのPATH
+            path_entries.extend(os.environ.get('PATH', '').split(os.pathsep))
+            
+            # Windowsレジストリから環境変数を直接読み取る
+            try:
+                import winreg
+                # ユーザー環境変数
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+                        user_path = winreg.QueryValueEx(key, "PATH")[0]
+                        path_entries.extend(user_path.split(os.pathsep))
+                except (FileNotFoundError, OSError):
+                    pass
+                
+                # システム環境変数
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
+                        sys_path = winreg.QueryValueEx(key, "PATH")[0]
+                        path_entries.extend(sys_path.split(os.pathsep))
+                except (FileNotFoundError, OSError):
+                    pass
+            except ImportError:
+                pass  # winregが利用できない場合（Linuxなど）はスキップ
+            
+            # PATH文字列からffmpegを探す
+            for path_entry in path_entries:
+                if path_entry and 'ffmpeg' in path_entry.lower():
+                    ffmpeg_exe = Path(path_entry) / "ffmpeg.exe"
+                    if ffmpeg_exe.exists():
+                        ffmpeg = str(ffmpeg_exe)
+                        break
+        
         # region agent log
         _agent_log("H1", "media_downloader.py:_download_hls_with_ffmpeg", "ffmpeg_check", {"ffmpeg_path": ffmpeg or "NOT_FOUND", "tweet_id": tweet_id})
         # endregion
@@ -453,11 +786,12 @@ class MediaDownloader:
         # Refererが必要なケースに備えて、ffmpegにヘッダを渡す
         # -headers は "Key: Value\r\n" 形式を連結
         headers = f"Referer: {referer}\r\n"
+        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
         if self.config.TWITTER_COOKIES:
             headers += f"Cookie: {self.config.TWITTER_COOKIES}\r\n"
         
         # region agent log
-        _agent_log("H4", "media_downloader.py:_download_hls_with_ffmpeg", "before_cmd", {"has_cookie": bool(self.config.TWITTER_COOKIES), "headers_len": len(headers), "tweet_id": tweet_id})
+        _agent_log("H4", "media_downloader.py:_download_hls_with_ffmpeg", "before_cmd", {"has_cookie": bool(self.config.TWITTER_COOKIES), "headers_len": len(headers), "has_user_agent": "User-Agent" in headers, "tweet_id": tweet_id})
         # endregion
 
         cmd = [

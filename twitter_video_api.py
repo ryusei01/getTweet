@@ -53,11 +53,14 @@ def _safe_url_tag(url: Optional[str]) -> str:
 def _best_m3u8_from_master(m3u8_url: str, sess: requests.Session, referer: str) -> str:
     """master m3u8なら最高帯域のvariantを選び、そうでなければそのまま返す"""
     try:
+        _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "enter", {"m3u8_url": _safe_url_tag(m3u8_url)})
         r = sess.get(m3u8_url, timeout=20, headers={"Referer": referer})
         if r.status_code != 200:
+            _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "status_not_200", {"status": r.status_code})
             return m3u8_url
         text = r.text or ""
         if "#EXT-X-STREAM-INF" not in text:
+            _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "not_master_playlist", {})
             return m3u8_url
 
         best_bw = -1
@@ -80,13 +83,37 @@ def _best_m3u8_from_master(m3u8_url: str, sess: requests.Session, referer: str) 
                         best_uri = uri
 
         if not best_uri:
+            _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "no_best_uri", {})
             return m3u8_url
 
         if best_uri.startswith("http"):
+            _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "absolute_uri", {"best_uri": _safe_url_tag(best_uri)})
             return best_uri
-        base = m3u8_url.rsplit("/", 1)[0]
-        return f"{base}/{best_uri.lstrip('/')}"
-    except Exception:
+        
+        # region agent log - URL resolution fix
+        # URIが/で始まる場合はオリジン（プロトコル+ドメイン）からの絶対パス
+        # URIが/で始まらない場合は相対パス
+        if best_uri.startswith("/"):
+            # 絶対パス: オリジンと結合
+            from urllib.parse import urlparse
+            parsed = urlparse(m3u8_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            resolved_url = f"{origin}{best_uri}"
+        else:
+            # 相対パス: ベースディレクトリと結合
+            base = m3u8_url.rsplit("/", 1)[0]
+            resolved_url = f"{base}/{best_uri}"
+        
+        _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "resolving_relative", {
+            "m3u8_url": _safe_url_tag(m3u8_url),
+            "best_uri": _safe_url_tag(best_uri),
+            "resolved_url": _safe_url_tag(resolved_url),
+            "is_absolute_path": best_uri.startswith("/")
+        })
+        # endregion
+        return resolved_url
+    except Exception as e:
+        _agent_log("URL-FIX-1", "twitter_video_api.py:_best_m3u8_from_master", "exception", {"err": str(e)[:160]})
         return m3u8_url
 
 
@@ -176,10 +203,27 @@ def resolve_best_video_url(tweet_url: str) -> Optional[str]:
     if not m3u8s:
         return None
 
+    # region agent log
+    _agent_log("URL-FIX-2", "twitter_video_api.py:resolve_best_video_url", "calling_best_m3u8", {
+        "tweet_url": _safe_url_tag(tweet_url),
+        "m3u8_url": _safe_url_tag(m3u8s[0])
+    })
+    # endregion
+
     sess = requests.Session()
     if Config.TWITTER_COOKIES:
         sess.headers["Cookie"] = Config.TWITTER_COOKIES
-    return _best_m3u8_from_master(m3u8s[0], sess, referer=tweet_url)
+    result = _best_m3u8_from_master(m3u8s[0], sess, referer=tweet_url)
+    
+    # region agent log
+    _agent_log("URL-FIX-2", "twitter_video_api.py:resolve_best_video_url", "returning_result", {
+        "input_m3u8": _safe_url_tag(m3u8s[0]),
+        "result": _safe_url_tag(result)
+    })
+    # endregion
+    
+    return result
+
 
 
 
